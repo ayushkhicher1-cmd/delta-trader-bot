@@ -116,19 +116,39 @@ def execute(symbol, side, entry, sl, tp):
 
     log("Delta response: " + str(res))
 
-# ================= WEBHOOK =================
+# ================= SAFE WEBHOOK =================
 
 @app.route("/", methods=["POST"])
 def webhook():
     try:
-        msg = request.data.decode()
-        parts = msg.split("|")
 
-        symbol = parts[1]
-        side   = parts[2]
-        entry  = float(parts[3].split("=")[1])
-        sl     = float(parts[4].split("=")[1])
-        tp     = float(parts[5].split("=")[1])
+        raw = request.data.decode().strip()
+
+        if not raw:
+            log("⚠️ Empty webhook received")
+            return "EMPTY"
+
+        log("RAW WEBHOOK → " + raw)
+
+        # ===== JSON ALERT SUPPORT (future safe) =====
+        if raw.startswith("{"):
+            data = json.loads(raw)
+
+            symbol = data["symbol"]
+            side   = data["side"]
+            entry  = float(data["entry"])
+            sl     = float(data["sl"])
+            tp     = float(data["tp"])
+
+        # ===== YOUR ORIGINAL PIPE FORMAT =====
+        else:
+            parts = raw.split("|")
+
+            symbol = parts[1].strip()
+            side   = parts[2].strip()
+            entry  = float(parts[3].split("=")[1])
+            sl     = float(parts[4].split("=")[1])
+            tp     = float(parts[5].split("=")[1])
 
         execute(symbol, side, entry, sl, tp)
         return "OK"
