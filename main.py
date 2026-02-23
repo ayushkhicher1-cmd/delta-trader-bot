@@ -1,5 +1,5 @@
 from flask import Flask, request
-import time, hmac, hashlib, json, requests, os, re
+import time, hmac, hashlib, json, requests, os
 
 API_KEY    = os.environ.get("DELTA_API_KEY")
 API_SECRET = os.environ.get("DELTA_SECRET")
@@ -10,9 +10,6 @@ BASE_CAPITAL = 20.0
 RISK_PERCENT = 2.0
 ONE_TRADE_ONLY = True
 KILL_SWITCH = False
-
-# FORCE BTC ONLY (ALERT SYMBOL IGNORE)
-BTC_PRIORITY = ["BTCUSD","BTCUSDT","BTCUSDTPERP"]
 
 app = Flask(__name__)
 
@@ -44,36 +41,40 @@ def load_products():
         for p in res.get("result", []):
             sym = p["symbol"].upper()
             PRODUCT_CACHE[sym] = int(p["id"])
+
             step = float(p.get("contract_size", 0.001))
-            PRODUCT_META[sym] = {"id": int(p["id"]), "step": step}
+            PRODUCT_META[sym] = {
+                "id": int(p["id"]),
+                "step": step
+            }
 
         log(f"Loaded {len(PRODUCT_CACHE)} products into cache")
 
     except Exception as e:
         log("Product preload failed: " + str(e))
 
-# ================= FORCE BTC PRODUCT =================
-def get_product_id():
+# ================= GET PRODUCT ID =================
+def get_product_id(tv_symbol):
+    tv_symbol = tv_symbol.upper().replace(".P","")
+    pid = PRODUCT_CACHE.get(tv_symbol)
 
-    for sym in BTC_PRIORITY:
-        if sym in PRODUCT_CACHE:
-            log(f"Using BTC product: {sym}")
-            return PRODUCT_CACHE[sym]
+    if pid:
+        return int(pid)
 
-    log("NO BTC PRODUCT FOUND")
-    return None
+    log(f"Product not found in cache: {tv_symbol}")
+    return tv_symbol
 
 # ================= ALIGN QTY =================
 def align_qty(symbol, qty):
+    symbol = symbol.upper().replace(".P","")
+    meta = PRODUCT_META.get(symbol)
 
-    for s in BTC_PRIORITY:
-        meta = PRODUCT_META.get(s)
-        if meta:
-            step = meta["step"]
-            aligned = (qty // step) * step
-            return float(aligned)
+    if not meta:
+        return qty
 
-    return qty
+    step = meta["step"]
+    aligned = (qty // step) * step
+    return float(aligned)
 
 # ================= ACCOUNT =================
 def get_balance():
@@ -89,14 +90,14 @@ def get_balance():
         pass
     return 0.0
 
-def get_position(product_id):
+def get_position(symbol):
     path = "/positions"
     headers = sign("GET", path)
     res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for pos in res["result"]:
-            if int(pos["product_id"]) == int(product_id):
+            if int(pos["product_id"]) == int(symbol):
                 return float(pos["size"])
     except:
         pass
@@ -110,7 +111,7 @@ def place_order(payload):
     return requests.post(BASE_URL + path, headers=headers, data=body).json()
 
 # ================= EXECUTION =================
-def execute(side, entry, sl, tp):
+def execute(symbol, side, entry, sl, tp):
 
     global LAST_SIGNAL
 
@@ -118,11 +119,7 @@ def execute(side, entry, sl, tp):
         log("KILL SWITCH ENABLED")
         return
 
-    product_id = get_product_id()
-    if not product_id:
-        return
-
-    current_sig = f"{product_id}-{side}-{entry}-{sl}-{tp}"
+    current_sig = f"{symbol}-{side}-{entry}-{sl}-{tp}"
     now = time.time()
 
     if current_sig == LAST_SIGNAL["sig"] and now - LAST_SIGNAL["time"] < 60:
@@ -132,10 +129,12 @@ def execute(side, entry, sl, tp):
     LAST_SIGNAL["sig"] = current_sig
     LAST_SIGNAL["time"] = now
 
+    product_id = get_product_id(symbol)
+
     if ONE_TRADE_ONLY:
         pos = get_position(product_id)
         if abs(pos) > 0:
-            log("Trade blocked - position already open")
+            log("Trade blocked – position already open")
             return
 
     risk_per_unit = abs(entry - sl)
@@ -152,7 +151,7 @@ def execute(side, entry, sl, tp):
     max_risk = effective_capital * (RISK_PERCENT / 100)
 
     qty = max_risk / risk_per_unit
-    qty = align_qty("BTC", qty)
+    qty = align_qty(symbol, qty)
 
     log(f"PID={product_id} Balance={balance} Qty={qty}")
 
@@ -169,65 +168,32 @@ def execute(side, entry, sl, tp):
     res = place_order(entry_payload)
     log("ENTRY: " + str(res))
 
-    state = res.get("result", {}).get("state")
-    if not res.get("success") or state not in ["open","filled"]:
-        log("Entry rejected — aborting SL/TP")
-        return
-
-    filled = False
-    for _ in range(10):
-        pos = get_position(product_id)
-        if abs(pos) > 0:
-            filled = True
-            break
-        time.sleep(0.2)
-
-    if not filled:
-        log("Position not confirmed — aborting SL/TP")
-        return
-
-    sl_payload = {
-        "product_id": int(product_id),
-        "size": round(qty,4),
-        "side": opposite,
-        "order_type": "stop_market",
-        "stop_price": round(sl,2),
-        "reduce_only": True
-    }
-
-    log("SL: " + str(place_order(sl_payload)))
-
-    tp_payload = {
-        "product_id": int(product_id),
-        "size": round(qty,4),
-        "side": opposite,
-        "order_type": "limit",
-        "limit_price": round(tp,2),
-        "reduce_only": True
-    }
-
-    log("TP: " + str(place_order(tp_payload)))
-
 # ================= WEBHOOK =================
 @app.route("/", methods=["POST"])
 def webhook():
     try:
-        raw = request.data.decode().strip()
+        raw = request.data.decode("utf-8", errors="ignore").strip()
+
+        # ⭐⭐⭐ DEBUG LINE (MAIN FIX) ⭐⭐⭐
+        log(f"RAW BODY => '{raw}'")
 
         if raw == "" or "|" not in raw:
-            log("Ignored empty alert")
+            log("Ignored empty/non-strategy alert")
             return "IGNORED"
 
         parts = raw.split("|")
 
-        # CLEAN FLOAT PARSE FIX
-        entry = float(re.sub(r"[^\d\.]", "", parts[3].split("=")[1]))
-        sl    = float(re.sub(r"[^\d\.]", "", parts[4].split("=")[1]))
-        tp    = float(re.sub(r"[^\d\.]", "", parts[5].split("=")[1]))
+        if len(parts) < 6:
+            log("Invalid alert format")
+            return "BAD"
 
-        side  = parts[2]
+        symbol = parts[1]
+        side   = parts[2]
+        entry  = float(parts[3].split("=")[1])
+        sl     = float(parts[4].split("=")[1])
+        tp     = float(parts[5].split("=")[1])
 
-        execute(side, entry, sl, tp)
+        execute(symbol, side, entry, sl, tp)
 
         return "OK"
 
