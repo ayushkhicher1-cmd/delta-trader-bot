@@ -19,7 +19,7 @@ PRODUCT_META  = {}
 
 # ================= LOGGER =================
 def log(msg):
-    print(msg, flush=True)
+    print(msg)
 
 # ================= SIGN =================
 def sign(method, path, body=""):
@@ -40,7 +40,6 @@ def load_products():
 
         for p in res.get("result", []):
             sym = p["symbol"].upper()
-
             PRODUCT_CACHE[sym] = int(p["id"])
 
             step = float(p.get("contract_size", 0.001))
@@ -54,35 +53,27 @@ def load_products():
     except Exception as e:
         log("Product preload failed: " + str(e))
 
-# ================= BTC PRODUCT AUTO FIX =================
+# ================= GET PRODUCT ID =================
 def get_product_id(tv_symbol):
-
     tv_symbol = tv_symbol.upper().replace(".P","")
 
-    # ⭐ direct match
-    if tv_symbol in PRODUCT_CACHE:
-        log(f"Using BTC product: {tv_symbol}")
-        return PRODUCT_CACHE[tv_symbol]
+    # BTC FORCE MAP (important)
+    if "BTC" in tv_symbol:
+        for name in ["BTCUSDT","BTCUSD","BTCUSD_PERP"]:
+            if name in PRODUCT_CACHE:
+                log(f"Using BTC product: {name}")
+                return PRODUCT_CACHE[name]
 
-    # ⭐ fallback priority (MAIN FIX)
-    priority = [
-        "BTCUSDT",
-        "BTCUSDTPERP",
-        "BTCUSD",
-        "BTCUSD-INR"
-    ]
+    pid = PRODUCT_CACHE.get(tv_symbol)
 
-    for name in priority:
-        if name in PRODUCT_CACHE:
-            log(f"Using BTC product: {name}")
-            return PRODUCT_CACHE[name]
+    if pid:
+        return int(pid)
 
-    log("No BTC product found in cache")
-    return 0
+    log(f"Product not found in cache: {tv_symbol}")
+    return tv_symbol
 
 # ================= ALIGN QTY =================
 def align_qty(symbol, qty):
-
     symbol = symbol.upper().replace(".P","")
     meta = PRODUCT_META.get(symbol)
 
@@ -107,25 +98,32 @@ def get_balance():
         pass
     return 0.0
 
-def get_position(product_id):
+def get_position(symbol):
     path = "/positions"
     headers = sign("GET", path)
     res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for pos in res["result"]:
-            if int(pos["product_id"]) == int(product_id):
+            if int(pos["product_id"]) == int(symbol):
                 return float(pos["size"])
     except:
         pass
     return 0.0
 
-# ================= ORDER =================
+# ================= ORDER (FIXED SAFE JSON) =================
 def place_order(payload):
     path = "/orders"
     body = json.dumps(payload)
     headers = sign("POST", path, body)
-    return requests.post(BASE_URL + path, headers=headers, data=body).json()
+
+    r = requests.post(BASE_URL + path, headers=headers, data=body)
+
+    try:
+        return r.json()
+    except:
+        log("Delta returned non-JSON: " + r.text)
+        return {"success": False}
 
 # ================= EXECUTION =================
 def execute(symbol, side, entry, sl, tp):
@@ -147,10 +145,6 @@ def execute(symbol, side, entry, sl, tp):
     LAST_SIGNAL["time"] = now
 
     product_id = get_product_id(symbol)
-
-    if product_id == 0:
-        log("No valid BTC product id")
-        return
 
     if ONE_TRADE_ONLY:
         pos = get_position(product_id)
@@ -218,7 +212,8 @@ def execute(symbol, side, entry, sl, tp):
         "reduce_only": True
     }
 
-    log("SL: " + str(place_order(sl_payload)))
+    res2 = place_order(sl_payload)
+    log("SL: " + str(res2))
 
     # ===== TP =====
     tp_payload = {
@@ -230,14 +225,14 @@ def execute(symbol, side, entry, sl, tp):
         "reduce_only": True
     }
 
-    log("TP: " + str(place_order(tp_payload)))
+    res3 = place_order(tp_payload)
+    log("TP: " + str(res3))
 
 # ================= WEBHOOK =================
 @app.route("/", methods=["POST"])
 def webhook():
     try:
         raw = request.data.decode().strip()
-
         log("RAW BODY => " + raw)
 
         if raw == "" or "|" not in raw:
