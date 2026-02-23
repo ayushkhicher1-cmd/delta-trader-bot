@@ -33,18 +33,18 @@ def sign(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ================= PRELOAD PRODUCTS =================
+# ================= PRELOAD PRODUCTS (GLOBAL FIX) =================
 def load_products():
     try:
-        res = requests.get(BASE_URL + "/products").json()
+        res = requests.get(BASE_URL + "/v2/products").json()
 
         for p in res.get("result", []):
             sym = p["symbol"].upper()
 
             PRODUCT_CACHE[sym] = int(p["id"])
 
-            # 🔥 Step size meta
-            step = float(p.get("contract_value", 0.001))
+            # GLOBAL step size
+            step = float(p.get("contract_size", 0.001))
             PRODUCT_META[sym] = {
                 "id": int(p["id"]),
                 "step": step
@@ -76,7 +76,6 @@ def align_qty(symbol, qty):
         return qty
 
     step = meta["step"]
-
     aligned = (qty // step) * step
     return float(aligned)
 
@@ -173,7 +172,6 @@ def execute(symbol, side, entry, sl, tp):
     res = place_order(entry_payload)
     log("ENTRY: " + str(res))
 
-    # 🔥 STRONG ENTRY VERIFY
     state = res.get("result", {}).get("state")
     if not res.get("success") or state not in ["open","filled"]:
         log("Entry rejected — aborting SL/TP")
@@ -247,14 +245,6 @@ def webhook():
     except Exception as e:
         log("Webhook error: " + str(e))
         return "ERR"
-
-# ================= IP CHECK =================
-@app.route("/ip")
-def ip():
-    try:
-        return requests.get("https://api.ipify.org").text
-    except:
-        return "IP_ERROR"
 
 # ================= RUN =================
 if __name__ == "__main__":
