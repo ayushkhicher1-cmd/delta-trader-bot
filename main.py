@@ -19,7 +19,7 @@ PRODUCT_META  = {}
 
 # ================= LOGGER =================
 def log(msg):
-    print(msg)
+    print(msg, flush=True)
 
 # ================= SIGN =================
 def sign(method, path, body=""):
@@ -40,6 +40,7 @@ def load_products():
 
         for p in res.get("result", []):
             sym = p["symbol"].upper()
+
             PRODUCT_CACHE[sym] = int(p["id"])
 
             step = float(p.get("contract_size", 0.001))
@@ -53,19 +54,35 @@ def load_products():
     except Exception as e:
         log("Product preload failed: " + str(e))
 
-# ================= GET PRODUCT ID =================
+# ================= BTC PRODUCT AUTO FIX =================
 def get_product_id(tv_symbol):
+
     tv_symbol = tv_symbol.upper().replace(".P","")
-    pid = PRODUCT_CACHE.get(tv_symbol)
 
-    if pid:
-        return int(pid)
+    # ⭐ direct match
+    if tv_symbol in PRODUCT_CACHE:
+        log(f"Using BTC product: {tv_symbol}")
+        return PRODUCT_CACHE[tv_symbol]
 
-    log(f"Product not found in cache: {tv_symbol}")
-    return tv_symbol
+    # ⭐ fallback priority (MAIN FIX)
+    priority = [
+        "BTCUSDT",
+        "BTCUSDTPERP",
+        "BTCUSD",
+        "BTCUSD-INR"
+    ]
+
+    for name in priority:
+        if name in PRODUCT_CACHE:
+            log(f"Using BTC product: {name}")
+            return PRODUCT_CACHE[name]
+
+    log("No BTC product found in cache")
+    return 0
 
 # ================= ALIGN QTY =================
 def align_qty(symbol, qty):
+
     symbol = symbol.upper().replace(".P","")
     meta = PRODUCT_META.get(symbol)
 
@@ -90,14 +107,14 @@ def get_balance():
         pass
     return 0.0
 
-def get_position(symbol):
+def get_position(product_id):
     path = "/positions"
     headers = sign("GET", path)
     res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for pos in res["result"]:
-            if int(pos["product_id"]) == int(symbol):
+            if int(pos["product_id"]) == int(product_id):
                 return float(pos["size"])
     except:
         pass
@@ -131,6 +148,10 @@ def execute(symbol, side, entry, sl, tp):
 
     product_id = get_product_id(symbol)
 
+    if product_id == 0:
+        log("No valid BTC product id")
+        return
+
     if ONE_TRADE_ONLY:
         pos = get_position(product_id)
         if abs(pos) > 0:
@@ -158,6 +179,7 @@ def execute(symbol, side, entry, sl, tp):
     delta_side = "buy" if side == "LONG" else "sell"
     opposite   = "sell" if side == "LONG" else "buy"
 
+    # ===== ENTRY =====
     entry_payload = {
         "product_id": int(product_id),
         "size": round(qty,4),
@@ -168,14 +190,55 @@ def execute(symbol, side, entry, sl, tp):
     res = place_order(entry_payload)
     log("ENTRY: " + str(res))
 
+    state = res.get("result", {}).get("state")
+    if not res.get("success") or state not in ["open","filled"]:
+        log("Entry rejected — aborting SL/TP")
+        return
+
+    # ===== WAIT POSITION =====
+    filled = False
+    for _ in range(10):
+        pos = get_position(product_id)
+        if abs(pos) > 0:
+            filled = True
+            break
+        time.sleep(0.2)
+
+    if not filled:
+        log("Position not confirmed — aborting SL/TP")
+        return
+
+    # ===== SL =====
+    sl_payload = {
+        "product_id": int(product_id),
+        "size": round(qty,4),
+        "side": opposite,
+        "order_type": "stop_market",
+        "stop_price": round(sl,2),
+        "reduce_only": True
+    }
+
+    log("SL: " + str(place_order(sl_payload)))
+
+    # ===== TP =====
+    tp_payload = {
+        "product_id": int(product_id),
+        "size": round(qty,4),
+        "side": opposite,
+        "order_type": "limit",
+        "limit_price": round(tp,2),
+        "reduce_only": True
+    }
+
+    log("TP: " + str(place_order(tp_payload)))
+
 # ================= WEBHOOK =================
 @app.route("/", methods=["POST"])
 def webhook():
     try:
-        raw = request.data.decode("utf-8", errors="ignore").strip()
+        raw = request.data.decode().strip()
 
-        # ⭐⭐⭐ DEBUG LINE (MAIN FIX) ⭐⭐⭐
-        log(f"RAW BODY => '{raw}'")
+        log("RAW BODY => " + raw)
 
         if raw == "" or "|" not in raw:
             log("Ignored empty/non-strategy alert")
