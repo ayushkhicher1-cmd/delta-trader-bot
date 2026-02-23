@@ -1,5 +1,5 @@
 from flask import Flask, request
-import time, hmac, hashlib, json, requests, os
+import time, hmac, hashlib, json, requests, os, re
 
 API_KEY    = os.environ.get("DELTA_API_KEY")
 API_SECRET = os.environ.get("DELTA_SECRET")
@@ -10,6 +10,9 @@ BASE_CAPITAL = 20.0
 RISK_PERCENT = 2.0
 ONE_TRADE_ONLY = True
 KILL_SWITCH = False
+
+# FORCE BTC ONLY (ALERT SYMBOL IGNORE)
+BTC_PRIORITY = ["BTCUSD","BTCUSDT","BTCUSDTPERP"]
 
 app = Flask(__name__)
 
@@ -33,51 +36,44 @@ def sign(method, path, body=""):
         "Content-Type": "application/json"
     }
 
-# ================= PRELOAD PRODUCTS (GLOBAL FIX) =================
+# ================= PRELOAD PRODUCTS =================
 def load_products():
     try:
         res = requests.get(BASE_URL + "/v2/products").json()
 
         for p in res.get("result", []):
             sym = p["symbol"].upper()
-
             PRODUCT_CACHE[sym] = int(p["id"])
-
-            # GLOBAL step size
             step = float(p.get("contract_size", 0.001))
-            PRODUCT_META[sym] = {
-                "id": int(p["id"]),
-                "step": step
-            }
+            PRODUCT_META[sym] = {"id": int(p["id"]), "step": step}
 
         log(f"Loaded {len(PRODUCT_CACHE)} products into cache")
 
     except Exception as e:
         log("Product preload failed: " + str(e))
 
-# ================= GET PRODUCT ID =================
-def get_product_id(tv_symbol):
-    tv_symbol = tv_symbol.upper().replace(".P","")
-    pid = PRODUCT_CACHE.get(tv_symbol)
+# ================= FORCE BTC PRODUCT =================
+def get_product_id():
 
-    if pid:
-        return int(pid)
+    for sym in BTC_PRIORITY:
+        if sym in PRODUCT_CACHE:
+            log(f"Using BTC product: {sym}")
+            return PRODUCT_CACHE[sym]
 
-    log(f"Product not found in cache: {tv_symbol}")
-    return tv_symbol
+    log("NO BTC PRODUCT FOUND")
+    return None
 
 # ================= ALIGN QTY =================
 def align_qty(symbol, qty):
 
-    symbol = symbol.upper().replace(".P","")
-    meta = PRODUCT_META.get(symbol)
+    for s in BTC_PRIORITY:
+        meta = PRODUCT_META.get(s)
+        if meta:
+            step = meta["step"]
+            aligned = (qty // step) * step
+            return float(aligned)
 
-    if not meta:
-        return qty
-
-    step = meta["step"]
-    aligned = (qty // step) * step
-    return float(aligned)
+    return qty
 
 # ================= ACCOUNT =================
 def get_balance():
@@ -93,14 +89,14 @@ def get_balance():
         pass
     return 0.0
 
-def get_position(symbol):
+def get_position(product_id):
     path = "/positions"
     headers = sign("GET", path)
     res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for pos in res["result"]:
-            if int(pos["product_id"]) == int(symbol):
+            if int(pos["product_id"]) == int(product_id):
                 return float(pos["size"])
     except:
         pass
@@ -114,7 +110,7 @@ def place_order(payload):
     return requests.post(BASE_URL + path, headers=headers, data=body).json()
 
 # ================= EXECUTION =================
-def execute(symbol, side, entry, sl, tp):
+def execute(side, entry, sl, tp):
 
     global LAST_SIGNAL
 
@@ -122,7 +118,11 @@ def execute(symbol, side, entry, sl, tp):
         log("KILL SWITCH ENABLED")
         return
 
-    current_sig = f"{symbol}-{side}-{entry}-{sl}-{tp}"
+    product_id = get_product_id()
+    if not product_id:
+        return
+
+    current_sig = f"{product_id}-{side}-{entry}-{sl}-{tp}"
     now = time.time()
 
     if current_sig == LAST_SIGNAL["sig"] and now - LAST_SIGNAL["time"] < 60:
@@ -132,12 +132,10 @@ def execute(symbol, side, entry, sl, tp):
     LAST_SIGNAL["sig"] = current_sig
     LAST_SIGNAL["time"] = now
 
-    product_id = get_product_id(symbol)
-
     if ONE_TRADE_ONLY:
         pos = get_position(product_id)
         if abs(pos) > 0:
-            log("Trade blocked – position already open")
+            log("Trade blocked - position already open")
             return
 
     risk_per_unit = abs(entry - sl)
@@ -154,14 +152,13 @@ def execute(symbol, side, entry, sl, tp):
     max_risk = effective_capital * (RISK_PERCENT / 100)
 
     qty = max_risk / risk_per_unit
-    qty = align_qty(symbol, qty)
+    qty = align_qty("BTC", qty)
 
     log(f"PID={product_id} Balance={balance} Qty={qty}")
 
     delta_side = "buy" if side == "LONG" else "sell"
     opposite   = "sell" if side == "LONG" else "buy"
 
-    # ===== ENTRY =====
     entry_payload = {
         "product_id": int(product_id),
         "size": round(qty,4),
@@ -177,7 +174,6 @@ def execute(symbol, side, entry, sl, tp):
         log("Entry rejected — aborting SL/TP")
         return
 
-    # ===== WAIT FOR POSITION CONFIRMATION =====
     filled = False
     for _ in range(10):
         pos = get_position(product_id)
@@ -190,7 +186,6 @@ def execute(symbol, side, entry, sl, tp):
         log("Position not confirmed — aborting SL/TP")
         return
 
-    # ===== SL =====
     sl_payload = {
         "product_id": int(product_id),
         "size": round(qty,4),
@@ -200,10 +195,8 @@ def execute(symbol, side, entry, sl, tp):
         "reduce_only": True
     }
 
-    res2 = place_order(sl_payload)
-    log("SL: " + str(res2))
+    log("SL: " + str(place_order(sl_payload)))
 
-    # ===== TP =====
     tp_payload = {
         "product_id": int(product_id),
         "size": round(qty,4),
@@ -213,8 +206,7 @@ def execute(symbol, side, entry, sl, tp):
         "reduce_only": True
     }
 
-    res3 = place_order(tp_payload)
-    log("TP: " + str(res3))
+    log("TP: " + str(place_order(tp_payload)))
 
 # ================= WEBHOOK =================
 @app.route("/", methods=["POST"])
@@ -223,22 +215,19 @@ def webhook():
         raw = request.data.decode().strip()
 
         if raw == "" or "|" not in raw:
-            log("Ignored empty/non-strategy alert")
+            log("Ignored empty alert")
             return "IGNORED"
 
         parts = raw.split("|")
 
-        if len(parts) < 6:
-            log("Invalid alert format")
-            return "BAD"
+        # CLEAN FLOAT PARSE FIX
+        entry = float(re.sub(r"[^\d\.]", "", parts[3].split("=")[1]))
+        sl    = float(re.sub(r"[^\d\.]", "", parts[4].split("=")[1]))
+        tp    = float(re.sub(r"[^\d\.]", "", parts[5].split("=")[1]))
 
-        symbol = parts[1]
-        side   = parts[2]
-        entry  = float(parts[3].split("=")[1])
-        sl     = float(parts[4].split("=")[1])
-        tp     = float(parts[5].split("=")[1])
+        side  = parts[2]
 
-        execute(symbol, side, entry, sl, tp)
+        execute(side, entry, sl, tp)
 
         return "OK"
 
