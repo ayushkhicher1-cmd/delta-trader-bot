@@ -57,7 +57,7 @@ def load_products():
 def get_product_id(tv_symbol):
     tv_symbol = tv_symbol.upper().replace(".P","")
 
-    # BTC FORCE MAP
+    # BTC FORCE MAP (important)
     if "BTC" in tv_symbol:
         for name in ["BTCUSDT","BTCUSD","BTCUSD_PERP"]:
             if name in PRODUCT_CACHE:
@@ -86,16 +86,9 @@ def align_qty(symbol, qty):
 
 # ================= ACCOUNT =================
 def get_balance():
-    path = "/v2/wallet/balances"   # ✅ FIXED
+    path = "/wallet/balances"
     headers = sign("GET", path)
-
-    r = requests.get(BASE_URL + path, headers=headers)
-
-    try:
-        res = r.json()
-    except:
-        log("Balance NON-JSON: " + r.text)
-        return 0.0
+    res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for asset in res["result"]:
@@ -106,16 +99,9 @@ def get_balance():
     return 0.0
 
 def get_position(symbol):
-    path = "/v2/positions"   # ✅ FIXED
+    path = "/positions"
     headers = sign("GET", path)
-
-    r = requests.get(BASE_URL + path, headers=headers)
-
-    try:
-        res = r.json()
-    except:
-        log("Position NON-JSON: " + r.text)
-        return 0.0
+    res = requests.get(BASE_URL + path, headers=headers).json()
 
     try:
         for pos in res["result"]:
@@ -125,7 +111,7 @@ def get_position(symbol):
         pass
     return 0.0
 
-# ================= ORDER =================
+# ================= ORDER (FIXED SAFE JSON) =================
 def place_order(payload):
     path = "/orders"
     body = json.dumps(payload)
